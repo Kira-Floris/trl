@@ -1203,6 +1203,7 @@ class DPOTrainer(Trainer):
                 **model_kwargs,
             )
             outputs_attentions = outputs.attentions
+            outputs_attentions_mask = prompt_attention_mask
             logits = outputs.logits
             loss_mask = completion_attention_mask.bool()
         else:
@@ -1259,6 +1260,7 @@ class DPOTrainer(Trainer):
             outputs = model(input_ids, output_attentions=True, **model_kwargs)
             logits = outputs.logits
             outputs_attentions = outputs.attentions
+            outputs_attentions_mask = attention_mask if not self.padding_free else None
 
             # Offset the logits by one to align with the labels
             labels = torch.roll(input_ids, shifts=-1, dims=1)
@@ -1347,7 +1349,7 @@ class DPOTrainer(Trainer):
         # Logic for Entropy Loss
         if self.entropy_weight > 0:
             _, _ = self.compute_batch_attention_entropy(
-                outputs_attentions, batch["attention_mask"]
+                outputs_attentions, outputs_attentions_mask
                 )
 
         return output
