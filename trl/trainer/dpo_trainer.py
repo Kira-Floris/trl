@@ -198,6 +198,8 @@ class DPOTrainer(Trainer):
             The function to use to preprocess the logits before computing the metrics.
         peft_config (`dict`, defaults to `None`):
             The PEFT configuration to use for training. If you pass a PEFT configuration, the model will be wrapped in a PEFT model.
+        entropy_weight (float: None): 
+            A floating value less or equal to 1 that tells how much the entropy will contribute to the loss 
     """
 
     _tag_names = ["trl", "dpo"]
@@ -219,9 +221,18 @@ class DPOTrainer(Trainer):
         optimizers: tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None),
         preprocess_logits_for_metrics: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None,
         peft_config: Optional[dict] = None,
+        entropy_weight: float = None,
     ):
         if model is None:
             raise ValueError("No model provided. Please provide a model to train.")
+        
+        if entropy_weight:
+            if entropy_weight <= 1:
+                self.entropy_weight = entropy_weight
+            else:
+                self.entropy_weight = 1
+        else:
+            self.entropy_weight = 0
 
         if not isinstance(model, str) and ref_model is model:
             raise ValueError(
@@ -1102,6 +1113,60 @@ class DPOTrainer(Trainer):
 
         return losses, chosen_rewards, rejected_rewards
 
+    def compute_batch_attention_entropy(self, attention_layers, attention_mask=None):
+        """
+        Efficiently computes attention entropy across all layers in a single batch operation.
+        
+        Args:
+            attention_layers: List of attention tensors, each with shape [batch_size, num_heads, seq_len, seq_len]
+            attention_mask: Optional mask with shape [batch_size, seq_len]
+            
+        Returns:
+            attention_entropy_loss: Scalar tensor containing the average entropy loss
+            valid_layer_count: Number of valid layers used in the calculation
+        """
+        # Stack all attention layers into a single tensor
+        # Shape: [num_layers, batch_size, num_heads, seq_len, seq_len]
+        stacked_attentions = torch.stack(attention_layers, dim=0)
+        
+        # Check if normalization is needed
+        attn_sums = stacked_attentions.sum(dim=-1)  # [num_layers, batch, heads, seq_len]
+        if not torch.allclose(attn_sums, torch.ones_like(attn_sums)):
+            # Apply softmax only if needed
+            stacked_attentions = torch.nn.functional.softmax(stacked_attentions, dim=-1)
+        
+        # Compute entropy for all layers at once
+        eps = 1e-8
+        stacked_attentions = torch.clamp(stacked_attentions, min=eps, max=1.0)
+        log_attentions = torch.log(stacked_attentions)
+        entropy_per_position = -torch.sum(stacked_attentions * log_attentions, dim=-1)  # [num_layers, batch, heads, seq_len]
+        
+        # Apply attention mask if provided
+        if attention_mask is not None:
+            # Expand mask dimensions for proper broadcasting
+            expanded_mask = attention_mask.unsqueeze(0).unsqueeze(2).float()  # [1, batch, 1, seq_len]
+            entropy_per_position = entropy_per_position * expanded_mask
+            
+            # Normalize by number of valid tokens
+            valid_tokens = expanded_mask.sum(dim=-1, keepdim=True).clamp(min=1.0)
+            entropy_per_position = entropy_per_position / valid_tokens
+        
+        # Average across batch, heads, and sequence length dimensions
+        layer_entropies = entropy_per_position.mean(dim=[1, 2, 3])  # [num_layers]
+        
+        # Filter out invalid values
+        valid_mask = ~torch.isnan(layer_entropies) & ~torch.isinf(layer_entropies)
+        valid_entropies = layer_entropies[valid_mask]
+        valid_layer_count = valid_mask.sum().item()
+        
+        # Return entropy loss and count of valid layers
+        if valid_layer_count > 0:
+            self.attention_entropy_loss = -valid_entropies.mean()
+            return self.attention_entropy_loss, valid_layer_count
+        
+        self.attention_entropy_loss = torch.tensor(0.0, device=stacked_attentions.device)
+        return self.attention_entropy_loss, 0
+
     def concatenated_forward(self, model: nn.Module, batch: dict[str, Union[list, torch.LongTensor]]):
         """Run the given model on the given batch of inputs, concatenating the chosen and rejected inputs together.
 
@@ -1134,8 +1199,10 @@ class DPOTrainer(Trainer):
                 input_ids=prompt_input_ids,
                 attention_mask=prompt_attention_mask,
                 labels=labels,  # we need the labels for the logits to be returned
+                output_attentions=True,
                 **model_kwargs,
             )
+            outputs_attentions = outputs.attentions
             logits = outputs.logits
             loss_mask = completion_attention_mask.bool()
         else:
@@ -1189,8 +1256,9 @@ class DPOTrainer(Trainer):
             else:
                 model_kwargs["attention_mask"] = attention_mask
 
-            outputs = model(input_ids, **model_kwargs)
+            outputs = model(input_ids, output_attentions=True, **model_kwargs)
             logits = outputs.logits
+            outputs_attentions = outputs.attentions
 
             # Offset the logits by one to align with the labels
             labels = torch.roll(input_ids, shifts=-1, dims=1)
@@ -1276,6 +1344,12 @@ class DPOTrainer(Trainer):
         if self.aux_loss_enabled:
             output["aux_loss"] = outputs.aux_loss
 
+        # Logic for Entropy Loss
+        if self.entropy_weight > 0:
+            _, _ = self.compute_batch_attention_entropy(
+                outputs_attentions, batch["prompt_attention_mask"]
+                )
+
         return output
 
     def get_batch_loss_metrics(
@@ -1358,6 +1432,9 @@ class DPOTrainer(Trainer):
         loss = loss.to(self.args.device)
         # force log the metrics
         self.store_metrics(metrics, train_eval="train")
+
+        if self.entropy_weight > 0:
+            loss = loss + self.entropy_weight * self.attention_entropy_loss
 
         if return_outputs:
             return loss, metrics
