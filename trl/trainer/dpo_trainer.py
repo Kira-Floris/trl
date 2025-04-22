@@ -1349,7 +1349,7 @@ class DPOTrainer(Trainer):
         # Logic for Entropy Loss
         if self.entropy_weight > 0:
             _, _ = self.compute_batch_attention_entropy(
-                outputs_attentions, outputs_attentions_mask
+                [att.to(dtype=torch.float16) for att in outputs_attentions], outputs_attentions_mask
                 )
 
         return output
